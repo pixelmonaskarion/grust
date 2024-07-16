@@ -1,0 +1,97 @@
+syntax = "proto3";
+package events;
+
+option go_package = "../gmproto";
+
+import "conversations.proto";
+import "authentication.proto";
+import "settings.proto";
+
+message UpdateEvents {
+    oneof event {
+        ConversationEvent conversationEvent = 2;
+        MessageEvent messageEvent = 3;
+        TypingEvent typingEvent = 4;
+        settings.Settings settingsEvent = 5;
+        UserAlertEvent userAlertEvent = 6;
+        BrowserPresenceCheckEvent browserPresenceCheckEvent = 7;
+        //ParticipantsEvent participantsEvent = 8;
+        //ConversationTypeEvent conversationTypeEvent = 9;
+        //FavoriteStickersEvent favoriteStickersEvent = 10;
+        //RecentStickerEvent recentStickerEvent = 11;
+        //CloudStoreInfoEvent cloudStoreInfoEvent = 12;
+        //BlobForAttachmentProgressUpdate blobForAttachmentProgressUpdate = 13;
+        AccountChangeOrSomethingEvent accountChange = 15;
+    }
+}
+
+message EncryptedData2Container {
+    AccountChangeOrSomethingEvent accountChange = 2;
+}
+
+message AccountChangeOrSomethingEvent {
+    string account = 1;
+    bool enabled = 2;
+}
+
+message ConversationEvent {
+    repeated conversations.Conversation data = 2;
+}
+
+message TypingEvent {
+    TypingData data = 2;
+}
+
+message MessageEvent {
+    repeated conversations.Message data = 2;
+}
+
+message UserAlertEvent {
+    AlertType alertType = 2;
+}
+
+message BrowserPresenceCheckEvent {}
+
+message TypingData {
+    string conversationID = 1;
+    User user = 2;
+    TypingTypes type = 3;
+}
+
+message User {
+    int64 field1 = 1;
+    string number = 2;
+}
+
+message RPCPairData {
+    oneof event {
+        authentication.PairedData paired = 4;
+        authentication.RevokePairData revoked = 5;
+    }
+}
+
+enum AlertType {
+    ALERT_TYPE_UNKNOWN = 0;
+    BROWSER_INACTIVE = 1; // Emitted whenever browser connection becomes inactive
+    BROWSER_ACTIVE = 2; // Emitted whenever a new browser session is created
+    MOBILE_DATA_CONNECTION = 3; // Emitted when the paired device connects to data
+    MOBILE_WIFI_CONNECTION = 4; // Emitted when the paired device connects to wifi
+    MOBILE_BATTERY_LOW = 5; // Emitted if the paired device reaches low battery
+    MOBILE_BATTERY_RESTORED = 6; // Emitted if the paired device has restored battery enough to not be considered low
+    BROWSER_INACTIVE_FROM_TIMEOUT = 7; // Emitted whenever browser connection becomes inactive due to timeout
+    BROWSER_INACTIVE_FROM_INACTIVITY = 8; // Emitted whenever browser connection becomes inactive due to inactivity
+    RCS_CONNECTION = 9; // Emitted whenever RCS connection has been established successfully
+    OBSERVER_REGISTERED = 10; // Unknown
+    MOBILE_DATABASE_SYNCING = 11; // Emitted whenever the paired device is attempting to sync db
+    MOBILE_DATABASE_SYNC_COMPLETE = 12; // Emitted whenever the paired device has completed the db sync
+    MOBILE_DATABASE_SYNC_STARTED = 13; // Emitted whenever the paired device has begun syncing the db
+    MOBILE_DATABASE_PARTIAL_SYNC_COMPLETED = 14; // Emitted whenever the paired device has successfully synced a chunk of the db
+    MOBILE_DATABASE_PARTIAL_SYNC_STARTED = 15; // Emitted whenever the paired device has begun syncing a chunk of the db
+    CONTACTS_REFRESH_STARTED = 16; // Emitted whenever the paired device has begun refreshing contacts
+    CONTACTS_REFRESH_COMPLETED = 17; // Emitted whenever the paired device has successfully refreshed contacts
+}
+
+enum TypingTypes {
+    STOPPED_TYPING = 0;
+    STARTED_TYPING = 1;
+}

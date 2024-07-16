@@ -1,0 +1,7 @@
+/target
+/src/service.json
+/src/cookies.txt
+/src/signin.html
+jwt.txt
+oauth.txt
+.DS_Store
