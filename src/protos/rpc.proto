@@ -11,6 +11,17 @@ message StartAckMessage {
     optional int32 count = 1;
 }
 
+message NewLongPollingPayloadInner {
+    optional bytes unknown4 = 4;
+    optional bytes unknown5 = 5;
+}
+
+message NewLongPollingPayload {
+    optional NewLongPollingPayloadInner idk = 1;
+    optional IncomingRPCMessage data = 2;
+    optional bytes heartbeat = 15;
+}
+
 message LongPollingPayload {
     optional IncomingRPCMessage data = 2;
     optional util.EmptyArr heartbeat = 3;

@@ -1,7 +1,6 @@
 use google_jwt_auth::{usage::Usage, AuthConfig};
+use log::trace;
 use reqwest::Client;
-use serde::{Deserialize, Serialize};
-use serde_json::json;
 
 // #[derive(Serialize, Deserialize)]
 // pub struct OauthToken {
@@ -30,7 +29,7 @@ pub async fn exchange_for_oauth(client: &Client, jwt: &str) -> String {
     // return token_data;
     let auth_config = AuthConfig::build(include_str!("service.json"), &Usage::OpenId).unwrap();
     let token = auth_config.generate_auth_token(3600).await.unwrap();
-    println!("{token}");
+    trace!("{token}");
     token
 }
 

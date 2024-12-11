@@ -6,28 +6,36 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-tokio = { version = "1", features = ["full"] }
-reqwest = { version = "0.12.4", features = ["json", "rustls-tls", "gzip", "stream", "cookies"] }
-serde = { version = "1.0", features = ["derive"] }
-protobuf = "3.4.0"
-protobuf-json-mapping = "3.4.0"
-protobuf-codegen = "3.4.0"
+tokio = { version = "1.42.0", features = ["full"] }
+reqwest = { version = "0.12.9", features = ["json", "rustls-tls", "gzip", "stream", "cookies"] }
+serde = { version = "1.0.215", features = ["derive"] }
+protobuf = {version = "3.7.1", features = [] }
+protobuf-json-mapping = "3.7.1"
+protobuf-codegen = "3.7.1"
 pblite_rust = {path = "../pblite-rust"}
 rand = "0.8.5"
 ring = "0.17.8"
 aes-gcm = "0.10.3"
-uuid = { version = "1.8.0", features = ["v4"] }
+uuid = { version = "1.11.0", features = ["v4", "serde"] }
 jsonwebkey = { version = "0.3.5", features = ["generate", "pkcs-convert"] }
 hex = "0.4.3"
-serde_json = "1.0.117"
+serde_json = "1.0.133"
 google-jwt-auth = "0.1.0"
 base64 = "0.22.1"
-headless_chrome = "1.0.10"
+headless_chrome = "1.0.15"
 x509-cert = { version = "0.2.5", features = ["pem"] }
 qrcode = "0.14.1"
-image = "0.25.1"
-anyhow = "1.0.86"
-futures-util = "0.3.30"
+image = "0.25.5"
+anyhow = "1.0.94"
+futures-util = "0.3.31"
+unescape = "0.1.0"
+escape-bytes = "0.1.1"
+ctr = "0.9.2"
+aes = "0.8.4"
+hex-literal = "0.4.1"
+log = "0.4.22"
+env_logger = "0.11.5"
 
 [build-dependencies]
-protobuf-codegen = "3.4.0"
+protobuf-codegen = "3.7.1"
+protobuf = {version = "3.7.1", features = [] }

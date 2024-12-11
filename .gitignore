@@ -5,3 +5,5 @@
 jwt.txt
 oauth.txt
 .DS_Store
+client.json
+qrcode.json
