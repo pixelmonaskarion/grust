@@ -20,7 +20,7 @@ pub struct Client {
     pub auth_data: AuthData,
     #[serde(skip_serializing, skip_deserializing, default)]
     pub http_client: reqwest::Client,
-    #[serde(serialize_with = "crate::serialize_proto", deserialize_with = "crate::deserialize_proto")]
+    #[serde(serialize_with = "crate::serializers::serialize_proto", deserialize_with = "crate::serializers::deserialize_proto")]
     pub config: Config,
 
     pub listen_id: i32,
@@ -47,12 +47,13 @@ pub struct AuthData {
     pub tachyon_auth_token: Vec<u8>,
     pub tachyon_expiry: SystemTime,
     pub tachyon_ttl: Duration,
-    #[serde(serialize_with = "crate::serialize_proto", deserialize_with = "crate::deserialize_proto")]
+    #[serde(serialize_with = "crate::serializers::serialize_proto", deserialize_with = "crate::serializers::deserialize_proto")]
     pub mobile: Device,
-    #[serde(serialize_with = "crate::serialize_proto", deserialize_with = "crate::deserialize_proto")]
+    #[serde(serialize_with = "crate::serializers::serialize_proto", deserialize_with = "crate::serializers::deserialize_proto")]
     pub browser: Device,
 }
 
+#[allow(unused)]
 pub struct PrimaryDeviceID {
 	reg_id: String,
 	unknown_int: u64,
@@ -97,6 +98,7 @@ impl Client {
         return config;
     }
 
+    #[allow(unused)]
     pub async fn do_gaia_pairing(&mut self, cookies: &str) {
         //worry about cookies later
         let gaia_resp = self.sign_in_gaia_get_token(cookies).await;
@@ -188,7 +190,7 @@ impl Client {
 
     async fn register_phone_relay(&self) -> RegisterPhoneRelayResponse {
         let key_der = self.auth_data.refresh_key.key.to_public().unwrap().to_der();
-        let mut payload = AuthenticationContainer {
+        let payload = AuthenticationContainer {
             authMessage: MessageField::some(AuthMessage {
                 requestID: Uuid::new_v4().to_string(),
                 network: QR_NETWORK.into(),
@@ -225,8 +227,8 @@ impl Client {
     fn generate_qr_code_data(&self, pairing_key: Vec<u8>) -> String {
         let url_data = URLData {
             pairingKey: pairing_key,
-            AESKey: self.auth_data.request_crypto.AESkey.clone(),
-            HMACKey: self.auth_data.request_crypto.HMACkey.clone(),
+            AESKey: self.auth_data.request_crypto.aes_key.clone(),
+            HMACKey: self.auth_data.request_crypto.hmac_key.clone(),
             ..Default::default()
         };
         let c_data = base64::engine::general_purpose::STANDARD.encode(url_data.write_to_bytes().unwrap());
@@ -237,7 +239,6 @@ impl Client {
         _self.lock().await.listen_id += 1;
         let listen_id = _self.lock().await.listen_id.clone();
         let listen_req_id = Uuid::new_v4().to_string();
-        let mut errorCount = 1;
         while _self.lock().await.listen_id == listen_id {
             let err = _self.lock().await.refresh_auth_token().await;
             if err.is_err() {
@@ -264,17 +265,20 @@ impl Client {
             let res = _self.lock().await.http_client.execute(req).await;
             if res.is_err() {
                 if let Some(connected_tx) = connected_tx {
-                    connected_tx.send(true).unwrap();
+                    warn!("failed to connect to the server!");
+                    connected_tx.send(false).unwrap();
                 }
                 return Ok(());
             }
             let res = res?;
             if res.status() != StatusCode::OK {
                 if let Some(connected_tx) = connected_tx {
-                    connected_tx.send(true).unwrap();
+                    warn!("the server responded with a non-ok status code!");
+                    connected_tx.send(false).unwrap();
                 }
                 return Ok(());
             }
+            info!("connected to the server!");
             if post_connect {
                 let mut stolen_connected_tx = None;
                 std::mem::swap(&mut stolen_connected_tx, &mut connected_tx);
@@ -296,19 +300,7 @@ impl Client {
                     continue;
                 }
                 pending_message_bytes.push(*byte);
-                // if let Ok(msg) = NewLongPollingPayload::parse_from_bytes(&pending_message_bytes) {
-                //     println!("finished message: {}", base64::encode(pending_message_bytes));
-                //     println!("got message: {msg:?}");
-                //     pending_message_bytes = vec![];
-                //     if let Some(data) = msg.data.as_ref() {
-                //         let handle_res = Self::handle_rpc_message(_self.clone(), data.clone()).await;
-                //         if handle_res.is_err() {
-                //             println!("failed to handle message: {}", handle_res.unwrap_err());
-                //         } else {
-                //             println!("successfully handled message!");
-                //         }
-                //     }
-                // }
+
                 if let Err(_) = String::from_utf8(pending_message_bytes.clone()) {
                     log::error!("message is not text! (probably protobuf)");
                     pending_message_bytes = vec![];
@@ -318,13 +310,7 @@ impl Client {
                 if message_string.len() < 2 {
                     continue;
                 }
-                // if !message_string.starts_with("[["){
-                //     println!("message does not start with [[! beeper said it would! clearing");
-                //     println!("clearing message {message_string}");
-                //     pending_message_bytes = vec![];
-                //     continue;
-                // }
-                // message_string = format!("{message_string}");
+
                 if message_string.chars().filter(|c| *c == '[').count() == message_string.chars().filter(|c| *c == ']').count() {
                     trace!("payload should be done {message_string}");
                     skip_count = 1;
@@ -345,7 +331,6 @@ impl Client {
 
     async fn handle_rpc_message(_self: Arc<Mutex<Self>>, raw_msg: IncomingRPCMessage) -> anyhow::Result<()> {
         _self.lock().await.ack_messages.push(raw_msg.responseID.clone());
-        info!("got message! {}", raw_msg.bugleRoute.enum_value().map(|e| format!("{e:?}")).unwrap_or_default());
         if raw_msg.bugleRoute.enum_value_or_default() == BugleRoute::PairEvent {
             debug!("completing pairing {raw_msg}");
             let paired_data = RPCPairData::parse_from_bytes(&raw_msg.messageData).unwrap();
@@ -360,7 +345,6 @@ impl Client {
             if let Ok(rpc_message) = RPCMessageData::parse_from_bytes(&raw_msg.messageData) {
                 let msg = Self::decrypt_internal_message(_self.clone(), rpc_message.clone()).await.unwrap();
                 debug!("received message: {} \n inner: {msg:?}", protobuf_json_mapping::print_to_string(&rpc_message).unwrap());
-                info!("checking for pending message with id {}", &rpc_message.sessionID);
                 if let Some(response_sender) = _self.lock().await.pending_messages.remove(&rpc_message.sessionID) {
                     response_sender.send(msg).unwrap();
                 }
@@ -380,21 +364,10 @@ impl Client {
         if let Some(pairing_tx) = std::mem::take(&mut _self.lock().await.pairing_complete) {
             pairing_tx.send(true).unwrap();
         }
-        // Self::reconnect(_self).await;
     }
-
-    // async fn reconnect(_self: Arc<Mutex<Self>>) -> anyhow::Result<()> {
-    //     if let Some(conn_handle) = &_self.lock().await.conn_handle {
-    //         conn_handle.abort();
-    //         println!("killed connection!");
-    //     }
-    //     Self::connect(_self.clone()).await;
-    //     Ok(())
-    // }
 
     pub async fn connect(_self: Arc<Mutex<Self>>) -> anyhow::Result<bool> {
         _self.lock().await.refresh_auth_token().await?;
-        // c.bumpNextDataReceiveCheck(10 * time.Minute);
         let (connected_tx, connected_rx) = oneshot::channel();
         tokio::spawn(Self::do_long_poll(_self.clone(), true, true, Some(connected_tx)));
         let ack_self = _self.clone();
@@ -407,22 +380,15 @@ impl Client {
             }
         });
         Ok(connected_rx.await?)
-        // go c.doLongPoll(true, c.postConnect)
-        // c.sessionHandler.startAckInterval()
     }
 
     async fn post_connect(_self: Arc<Mutex<Self>>, connected_tx: Option<oneshot::Sender<bool>>) {
-        debug!("waiting two seconds for acks");
-        sleep(Duration::from_secs(2)).await;
         let _ = Self::send_ack_request(_self.clone()).await;
-        debug!("waiting one second for active session");
-        sleep(Duration::from_secs(1)).await;
         Self::set_active_session(_self.clone()).await.unwrap();
-        sleep(Duration::from_secs(2)).await;
-        debug!("waited two seconds chill");
         let ActionMessage::IsBugleDefault(bugle_default) = Self::send_message(_self.clone(), ActionType::IS_BUGLE_DEFAULT, false, None::<&IsBugleDefaultResponse>, false, Uuid::new_v4().into(), None, None).await.unwrap() else { panic!() };
-        debug!("bugle default: {}", bugle_default.success);
+        trace!("bugle default: {}", bugle_default.success);
         if let Some(connected_tx) = connected_tx {
+            info!("ready to send");
             connected_tx.send(true).unwrap();
         }
     }
@@ -445,7 +411,6 @@ impl Client {
         let (response_tx, response_rx) = oneshot::channel();
         _self.lock().await.pending_messages.insert(request_id.clone(), response_tx);
         Self::send_message_no_response(_self, action, omit_ttl, data, dont_encrypt, request_id.clone(), message_type, custom_ttl).await?;
-        info!("waiting for response with id: {request_id}");
         let response = response_rx.await;
         Ok(response?)
     }

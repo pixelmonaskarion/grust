@@ -1,5 +1,3 @@
-pub const MESSAGES_BASE_URL: &'static str = "https://messages.google.com";
-
 pub const INSTANT_MESSAGING_BASE_URL: &'static str = "https://instantmessaging-pa.googleapis.com";
 pub const INSTANT_MESSAGING_BASE_URLGOOGLE: &'static str = "https://instantmessaging-pa.clients6.google.com";
 
