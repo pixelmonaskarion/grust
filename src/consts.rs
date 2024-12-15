@@ -18,3 +18,5 @@ pub const RECEIVE_MESSAGES_URL: &'static str = "/ReceiveMessages";
 pub const MESSAGING_BASE_URL: &'static str = "/$rpc/google.internal.communications.instantmessaging.v1.Messaging";
 pub const ACK_MESSAGES_URL: &'static str = "/AckMessages";
 pub const SEND_MESSAGE_URL: &'static str = "/SendMessage";
+
+pub const UPLOAD_MEDIA_URL: &'static str = "/upload";

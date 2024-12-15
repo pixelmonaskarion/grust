@@ -15,7 +15,7 @@ message UpdateEvents {
         settings.Settings settingsEvent = 5;
         UserAlertEvent userAlertEvent = 6;
         BrowserPresenceCheckEvent browserPresenceCheckEvent = 7;
-        //ParticipantsEvent participantsEvent = 8;
+        // ParticipantsEvent participantsEvent = 8;
         //ConversationTypeEvent conversationTypeEvent = 9;
         //FavoriteStickersEvent favoriteStickersEvent = 10;
         //RecentStickerEvent recentStickerEvent = 11;

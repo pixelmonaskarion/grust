@@ -1,4 +1,8 @@
+use aead::Aead;
+use aead::Nonce;
 use aes::Aes256;
+use aes_gcm::Aes256Gcm;
+use aes_gcm::KeyInit;
 use ctr::cipher::KeyIvInit;
 use ctr::cipher::StreamCipher;
 use rand::{RngCore, SeedableRng};
@@ -75,6 +79,68 @@ impl AESCTRHelper {
     }
 }
 
+const OUTGOING_RAW_CHUNK_SIZE: usize = 1 << 15;
+
+pub fn gcm_encrypt(key: &[u8], plaintext: Vec<u8>) -> Vec<u8> {
+    let crypto_key = aes_gcm::Key::<Aes256Gcm>::clone_from_slice(&key);
+    let cipher = Aes256Gcm::new(&crypto_key);
+
+    let chunk_size = OUTGOING_RAW_CHUNK_SIZE - 12 - 0; // minus nonce and overhead
+    
+	let mut encrypted = vec![0u8; 2];
+	encrypted[0] = 0;
+	encrypted[1] = (OUTGOING_RAW_CHUNK_SIZE as f32).log2() as u8;
+
+    let plaintext_chunks: Vec<&[u8]> = plaintext.chunks(chunk_size).collect();
+
+    for (i, chunk) in plaintext_chunks.iter().enumerate() {
+        let aad = &calculate_aad(i as u32, i+1 == plaintext_chunks.len());
+        let nonce = generate_key(12);
+        encrypted.append(&mut nonce.clone());
+        let mut encrypted_chunk = cipher.encrypt(&Nonce::<Aes256Gcm>::from_slice(&nonce), aead::Payload {
+            aad,
+            msg: chunk,
+        }).unwrap();
+        encrypted.append(&mut encrypted_chunk);
+    }
+
+    encrypted
+}
+
+pub fn gcm_decrypt(key: &[u8], ciphertext: Vec<u8>) -> Vec<u8> {
+    let crypto_key = aes_gcm::Key::<Aes256Gcm>::clone_from_slice(&key);
+    let cipher = Aes256Gcm::new(&crypto_key);
+
+    if ciphertext[0] != 0 {
+        panic!("first byte is not 0!");
+    }
+
+    let chunk_size = 1 << ciphertext[1];
+    let ciphertext = &ciphertext[2..];
+
+    let mut decrypted_data = vec![];
+
+    let ciphertext_chunks: Vec<&[u8]> = ciphertext.chunks(chunk_size).collect();
+    for (i, chunk) in ciphertext_chunks.iter().enumerate() {
+        let aad = &calculate_aad(i as u32, i+1 == ciphertext_chunks.len());
+        let nonce = &chunk[..12];
+        let chunk_no_nonce = &chunk[12..];
+        let mut decrypted_chunk = cipher.decrypt(&Nonce::<Aes256Gcm>::from_slice(&nonce), aead::Payload {
+            aad,
+            msg: chunk_no_nonce,
+        }).unwrap();
+        decrypted_data.append(&mut decrypted_chunk);
+    }
+    
+    decrypted_data
+}
+
+fn calculate_aad(i: u32, last_chunk: bool) -> Vec<u8> {
+    let mut aad = vec![if last_chunk { 1 } else { 0 }];
+    aad.append(&mut i.to_be_bytes().to_vec());
+    aad
+}
+
 #[cfg(test)]
 #[allow(deprecated)]
 mod test {
@@ -82,7 +148,16 @@ mod test {
 
     use crate::protos::{client::{ReceiveMessagesRequest, SendMessageRequest}, rpc::{OutgoingRPCData, OutgoingRPCMessage}};
 
-    use super::AESCTRHelper;
+    use super::{gcm_decrypt, gcm_encrypt, generate_key, AESCTRHelper};
+
+    #[test]
+    fn encrypt_decrypt_gcm() {
+        let plaintext = "Lorem Ipsum is simply dummy text of the printing and typesetting industry. Lorem Ipsum has been the industry's standard dummy text ever since the 1500s, when an unknown printer took a galley of type and scrambled it to make a type specimen book. It has survived not only five centuries, but also the leap into electronic typesetting, remaining essentially unchanged. It was popularised in the 1960s with the release of Letraset sheets containing Lorem Ipsum passages, and more recently with desktop publishing software like Aldus PageMaker including versions of Lorem Ipsum.";
+        let key = generate_key(32);
+        let ciphertext = gcm_encrypt(&key, plaintext.as_bytes().to_vec());
+        let decrypted = gcm_decrypt(&key, ciphertext);
+        println!("{}", String::from_utf8_lossy(&decrypted));
+    }
 
     #[test]
     fn encrypt_decrypt() {

@@ -1,17 +1,17 @@
 use core::panic;
-use std::{collections::HashMap, fmt::Debug, sync::Arc, time::{Duration, SystemTime}};
+use std::{collections::HashMap, sync::Arc, time::{Duration, SystemTime}};
 
 use base64::Engine;
-use jsonwebkey::{JsonWebKey, Key};
+use jsonwebkey::JsonWebKey;
 use log::{debug, info, trace, warn};
-use protobuf::{Enum, Message, MessageDyn, MessageField};
-use reqwest::{IntoUrl, Method, RequestBuilder, Response, StatusCode};
+use protobuf::{Enum, EnumOrUnknown, Message, MessageField, MessageFull};
+use reqwest::{header::HeaderMap, IntoUrl, Method, RequestBuilder, Response, StatusCode};
 use ring::{digest::SHA256, rand::SystemRandom, signature::{self}};
 use serde::{Deserialize, Serialize};
-use tokio::{sync::{oneshot::{self, Sender}, Mutex}, task::JoinHandle, time::sleep};
+use tokio::{sync::{mpsc, oneshot::{self, Sender}, Mutex}, task::JoinHandle, time::sleep};
 use uuid::Uuid;
-use crate::protos::{authentication::{authentication_container, register_refresh_request::NestedEmptyArr, AuthenticationContainer, BrowserDetails, BrowserType, DeviceType, ECDSAKeys, KeyData, PairedData, RegisterRefreshRequest, RegisterRefreshResponse}, client::{ack_message_request, receive_messages_request::UnknownEmptyObject2, AckMessageRequest, DeleteMessageResponse, GetConversationResponse, GetConversationTypeResponse, GetOrCreateConversationResponse, GetThumbnailResponse, IsBugleDefaultResponse, ListContactsResponse, ListConversationsResponse, ListMessagesResponse, ListTopContactsResponse, NotifyDittoActivityResponse, ReceiveMessagesRequest, SendMessageResponse, SendReactionResponse, UpdateConversationResponse}, events::{RPCPairData, UpdateEvents}, rpc::{outgoing_rpcmessage, ActionType, BugleRoute, IncomingRPCMessage, LongPollingPayload, MessageType, OutgoingRPCData, OutgoingRPCMessage, OutgoingRPCResponse, RPCMessageData}};
-use crate::{crypto::AESCTRHelper, protos::{authentication::{sign_in_gaia_request, AuthMessage, ConfigVersion, Device, RegisterPhoneRelayResponse, SignInGaiaRequest, SignInGaiaResponse, TokenData, URLData}, config::Config}};
+use crate::{consts::UPLOAD_MEDIA_URL, crypto::{gcm_encrypt, generate_key}, messages::{Attachment, Conversation, Event, RegularMessage, TypingMessage}, protos::{authentication::{authentication_container, register_refresh_request::NestedEmptyArr, AuthenticationContainer, BrowserDetails, BrowserType, DeviceType, ECDSAKeys, KeyData, PairedData, RegisterRefreshRequest, RegisterRefreshResponse}, client::{ack_message_request, receive_messages_request::UnknownEmptyObject2, AckMessageRequest, IsBugleDefaultResponse, ReceiveMessagesRequest, StartMediaUploadRequest, UploadMediaResponse}, conversations::{self, MediaContent, MediaFormats, MessageStatusType}, events::{RPCPairData, TypingTypes, UpdateEvents}, rpc::{outgoing_rpcmessage, ActionType, BugleRoute, IncomingRPCMessage, LongPollingPayload, MessageType, OutgoingRPCData, OutgoingRPCMessage, OutgoingRPCResponse, RPCMessageData}}, util::{config_version, mime_to_media_type}};
+use crate::{crypto::AESCTRHelper, protos::{authentication::{sign_in_gaia_request, AuthMessage, Device, RegisterPhoneRelayResponse, SignInGaiaRequest, SignInGaiaResponse, TokenData, URLData}, config::Config}};
 use crate::consts::{REGISTER_REFRESH_URL, ACK_MESSAGES_URL, INSTANT_MESSAGING_BASE_URL, MESSAGING_BASE_URL, PAIRING_BASE_URL, QR_CODE_URL_BASE, QR_NETWORK, RECEIVE_MESSAGES_URL, REGISTER_PHONE_RELAY_URL, SEND_MESSAGE_URL, USER_AGENT, CONFIG_URL, GOOGLE_NETWORK, INSTANT_MESSAGING_BASE_URLGOOGLE, REGISTRATION_BASE_URL, SIGN_IN_GAIA_URL};
 use futures_util::StreamExt;
 
@@ -32,7 +32,16 @@ pub struct Client {
     #[serde(skip_serializing, skip_deserializing, default = "return_none")]
     pub pairing_complete: Option<Sender<bool>>,
     #[serde(skip_serializing, skip_deserializing, default)]
-    pub pending_messages: HashMap<String, oneshot::Sender<ActionMessage>>,
+    pub pending_messages: HashMap<String, oneshot::Sender<Vec<u8>>>,
+    #[serde(skip_serializing, skip_deserializing, default)]
+    pub seen_message_ids: HashMap<String, conversations::Message>,
+    #[serde(skip_serializing, skip_deserializing, default = "new_message_channel")]
+    pub message_channel: (Arc<Mutex<mpsc::Receiver<Event>>>, mpsc::Sender<Event>),
+}
+
+fn new_message_channel() -> (Arc<Mutex<mpsc::Receiver<Event>>>, mpsc::Sender<Event>) {
+    let (tx, rx) = mpsc::channel(128);
+    (Arc::new(Mutex::new(rx)), tx)
 }
 
 fn return_none<T>() -> Option<T> {
@@ -61,11 +70,12 @@ pub struct PrimaryDeviceID {
 
 impl Client {
     pub async fn new() -> Self {
+        let message_channel = new_message_channel();
         let mut _self = Self {
             auth_data: AuthData {
                 request_crypto: AESCTRHelper::new(), 
                 session_id: Uuid::default(),
-                refresh_key: JsonWebKey::new(Key::generate_p256()),
+                refresh_key: JsonWebKey::new(jsonwebkey::Key::generate_p256()),
                 tachyon_auth_token: vec![],
                 tachyon_expiry: SystemTime::UNIX_EPOCH,
                 tachyon_ttl: Duration::ZERO,
@@ -80,6 +90,8 @@ impl Client {
             session_id: Uuid::new_v4().to_string(),
             pairing_complete: None,
             pending_messages: HashMap::new(),
+            seen_message_ids: HashMap::new(),
+            message_channel,
         };
         _self.config = _self.fetch_config().await;
         let device_id = &_self.config.deviceInfo.deviceID;
@@ -273,7 +285,7 @@ impl Client {
             let res = res?;
             if res.status() != StatusCode::OK {
                 if let Some(connected_tx) = connected_tx {
-                    warn!("the server responded with a non-ok status code!");
+                    warn!("the server responded with a non-ok status code! {}", res.status());
                     connected_tx.send(false).unwrap();
                 }
                 return Ok(());
@@ -343,11 +355,59 @@ impl Client {
         }
         if raw_msg.bugleRoute.value() == BugleRoute::DataEvent.value() {
             if let Ok(rpc_message) = RPCMessageData::parse_from_bytes(&raw_msg.messageData) {
-                let msg = Self::decrypt_internal_message(_self.clone(), rpc_message.clone()).await.unwrap();
-                debug!("received message: {} \n inner: {msg:?}", protobuf_json_mapping::print_to_string(&rpc_message).unwrap());
+                let msg_bytes = Self::decrypt_internal_message(_self.clone(), rpc_message.clone()).await.unwrap();
+                trace!("received message: {}", protobuf_json_mapping::print_to_string(&rpc_message).unwrap());
                 if let Some(response_sender) = _self.lock().await.pending_messages.remove(&rpc_message.sessionID) {
-                    response_sender.send(msg).unwrap();
+                    response_sender.send(msg_bytes.clone()).unwrap();
                 }
+                let message_tx = _self.lock().await.message_channel.1.clone();
+                tokio::spawn(async move {
+                    if rpc_message.action.value() == ActionType::GET_UPDATES.value() {
+                        if let Ok(event) = UpdateEvents::parse_from_bytes(&msg_bytes) {
+                            trace!("inner: {}", protobuf_json_mapping::print_to_string(&event).unwrap());
+                            if event.has_messageEvent() {
+                                let message_event = event.messageEvent();
+                                for message in message_event.data.clone() {
+                                    if let Some(message_status) = message.messageStatus.as_ref() {
+                                        if let Ok(status_val) = message_status.status.enum_value() {
+                                            if status_val == MessageStatusType::INCOMING_COMPLETE {
+                                                if _self.lock().await.seen_message_ids.get(&message.messageID) != Some(&message) {
+                                                    _self.lock().await.seen_message_ids.insert(message.messageID.clone(), message.clone());
+                                                    debug!("{}: {:?}", &message.messageID, status_val);
+                                                    trace!("{}", protobuf_json_mapping::print_to_string(&message).unwrap());
+                                                    let parsed_message = RegularMessage::from_proto(_self.clone(), message, true, true).await;
+                                                    message_tx.send(Event::Message(parsed_message)).await.unwrap();
+                                                }
+                                            } else {
+                                                debug!("{}: {:?}", &message.messageID, status_val);
+                                                trace!("{message:?}");
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            if event.has_typingEvent() {
+                                let typing_event = event.typingEvent();
+                                let typing_message = TypingMessage {
+                                    conversation_id: typing_event.data.conversationID.clone(),
+                                    typing: typing_event.data.type_.value() == TypingTypes::STARTED_TYPING.value(),
+                                    sender_number: typing_event.data.user.number.clone(),
+                                };
+                                message_tx.send(Event::Typing(typing_message)).await.unwrap();
+                            }
+                            if event.has_conversationEvent() {
+                                let conversation_event = event.conversationEvent();
+                                for proto_conversation in &conversation_event.data {
+                                    let conversation = Conversation {
+                                        group_name: if proto_conversation.isGroupChat { Some(proto_conversation.name.clone()) } else { None },
+                                        participants: proto_conversation.otherParticipants.clone(),
+                                    };
+                                    message_tx.send(Event::ConversationUpdate(conversation)).await.unwrap();
+                                }
+                            }
+                        }
+                    }
+                });
             } else {
                 warn!("failed to parse rpc message");
             }
@@ -373,7 +433,7 @@ impl Client {
         let ack_self = _self.clone();
         tokio::spawn(async move {
             loop {
-                tokio::time::sleep(Duration::from_secs(5)).await;
+                tokio::time::sleep(Duration::from_secs(1)).await;
                 if let Err(_) = Self::send_ack_request(ack_self.clone()).await {
                     warn!("send ack failed");
                 }
@@ -382,10 +442,16 @@ impl Client {
         Ok(connected_rx.await?)
     }
 
+    pub async fn receive_message(_self: Arc<Mutex<Self>>) -> Option<Event> {
+        let rx_mutex = _self.lock().await.message_channel.0.clone();
+        let mut rx = rx_mutex.lock().await;
+        rx.recv().await
+    }
+
     async fn post_connect(_self: Arc<Mutex<Self>>, connected_tx: Option<oneshot::Sender<bool>>) {
         let _ = Self::send_ack_request(_self.clone()).await;
         Self::set_active_session(_self.clone()).await.unwrap();
-        let ActionMessage::IsBugleDefault(bugle_default) = Self::send_message(_self.clone(), ActionType::IS_BUGLE_DEFAULT, false, None::<&IsBugleDefaultResponse>, false, Uuid::new_v4().into(), None, None).await.unwrap() else { panic!() };
+        let bugle_default: IsBugleDefaultResponse = Self::send_message_typed(_self.clone(), ActionType::IS_BUGLE_DEFAULT, false, None::<&IsBugleDefaultResponse>, false, Uuid::new_v4().into(), None, None).await.unwrap();
         trace!("bugle default: {}", bugle_default.success);
         if let Some(connected_tx) = connected_tx {
             info!("ready to send");
@@ -401,18 +467,32 @@ impl Client {
 
     pub async fn send_message_no_response(_self: Arc<Mutex<Self>>, action: ActionType, omit_ttl: bool, data: Option<&impl Message>, dont_encrypt: bool, request_id: String, message_type: Option<MessageType>, custom_ttl: Option<i64>) -> anyhow::Result<()> {
         let payload = Self::build_message(_self.clone(), action, omit_ttl, data, dont_encrypt, request_id, message_type, custom_ttl).await.unwrap();
-        debug!("payload: {}", protobuf_json_mapping::print_to_string(&payload).unwrap());
+        trace!("payload: {}", protobuf_json_mapping::print_to_string(&payload).unwrap());
         let url = format!("{INSTANT_MESSAGING_BASE_URL}{MESSAGING_BASE_URL}{SEND_MESSAGE_URL}");
         let _: OutgoingRPCResponse = _self.lock().await.typed_api_call(url, &payload).await?;
         Ok(())
     }
 
-    pub async fn send_message(_self: Arc<Mutex<Self>>, action: ActionType, omit_ttl: bool, data: Option<&impl Message>, dont_encrypt: bool, request_id: String, message_type: Option<MessageType>, custom_ttl: Option<i64>) -> anyhow::Result<ActionMessage> {
+    pub async fn send_message(_self: Arc<Mutex<Self>>, action: ActionType, omit_ttl: bool, data: Option<&impl Message>, dont_encrypt: bool, request_id: String, message_type: Option<MessageType>, custom_ttl: Option<i64>) -> anyhow::Result<Vec<u8>> {
         let (response_tx, response_rx) = oneshot::channel();
         _self.lock().await.pending_messages.insert(request_id.clone(), response_tx);
         Self::send_message_no_response(_self, action, omit_ttl, data, dont_encrypt, request_id.clone(), message_type, custom_ttl).await?;
         let response = response_rx.await;
         Ok(response?)
+    }
+
+    pub async fn send_message_typed<M: MessageFull>(_self: Arc<Mutex<Self>>, action: ActionType, omit_ttl: bool, data: Option<&impl Message>, dont_encrypt: bool, request_id: String, message_type: Option<MessageType>, custom_ttl: Option<i64>) -> anyhow::Result<M> {
+        let response = Self::send_message(_self, action, omit_ttl, data, dont_encrypt, request_id, message_type, custom_ttl).await?;
+        Ok(M::parse_from_bytes(&response)?)
+    }
+
+    #[allow(unused)]
+    pub async fn send_basic_message(_self: Arc<Mutex<Self>>, action: ActionType, data: Option<&impl Message>) -> anyhow::Result<Vec<u8>> {
+        Self::send_message(_self, action, false, data, false, Uuid::new_v4().into(), None, None).await
+    }
+
+    pub async fn send_basic_message_typed<M: MessageFull>(_self: Arc<Mutex<Self>>, action: ActionType, data: Option<&impl Message>) -> anyhow::Result<M> {
+        Self::send_message_typed::<M>(_self, action, false, data, false, Uuid::new_v4().into(), None, None).await
     }
 
     async fn send_ack_request(_self: Arc<Mutex<Self>>) -> anyhow::Result<()> {
@@ -424,6 +504,9 @@ impl Client {
                 ..Default::default()
             }
         }).collect();
+        if ack_messages.is_empty() {
+            return Ok(())
+        }
         let payload = AckMessageRequest {
             authData: MessageField::some(AuthMessage {
                 requestID: Uuid::new_v4().to_string(),
@@ -551,10 +634,98 @@ impl Client {
         Ok(message)
     }
 
-    pub async fn decrypt_internal_message(_self: Arc<Mutex<Self>>, rpc_message: RPCMessageData) -> anyhow::Result<ActionMessage> {
+    pub async fn decrypt_internal_message(_self: Arc<Mutex<Self>>, rpc_message: RPCMessageData) -> anyhow::Result<Vec<u8>> {
         let decrypted_data = _self.lock().await.auth_data.request_crypto.decrypt(rpc_message.encryptedData);
-        let action_message = parse_action_message(decrypted_data, rpc_message.action.enum_value_or_default()).unwrap();
-        Ok(action_message)
+        // let action_message = parse_action_message(decrypted_data, rpc_message.action.enum_value_or_default()).unwrap();
+        Ok(decrypted_data)
+    }
+
+    pub async fn upload_media(_self: Arc<Mutex<Self>>, attachment: &Attachment) -> MediaContent {
+        let key = generate_key(32);
+        let encrypted_bytes = gcm_encrypt(&key, attachment.data.clone());
+
+        let headers = Self::build_media_update_headers(encrypted_bytes.len().to_string(), "start".into(), "".into(), attachment.mime_type.clone(), "resumable".into());
+        let c = _self.lock().await;
+        let start_req = StartMediaUploadRequest {
+            attachmentType: 1,
+            authData: MessageField::some(AuthMessage {
+                requestID:        Uuid::new_v4().into(),
+                tachyonAuthToken: c.auth_data.tachyon_auth_token.clone(),
+                network:          "".into(),
+                configVersion:    MessageField::some(config_version()),
+                ..Default::default()
+            }),
+            mobile: MessageField::some(c.auth_data.mobile.clone()),
+            ..Default::default()
+        };
+    
+        let req_body = base64::engine::general_purpose::STANDARD.encode(start_req.write_to_bytes().unwrap());
+
+        let req = c.http_client.post(format!("{INSTANT_MESSAGING_BASE_URL}{UPLOAD_MEDIA_URL}")).headers(headers).body(req_body);
+        let res = c.http_client.execute(req.build().unwrap()).await.unwrap();
+        res.error_for_status_ref().unwrap();
+
+        let upload_url = res.headers().get("x-goog-upload-url").unwrap().to_str().unwrap();
+
+        let finalize_headers = Self::build_media_update_headers(encrypted_bytes.len().to_string(), "upload, finalize".into(), "0".into(), attachment.mime_type.clone(), "".into());
+        let req = c.http_client.post(upload_url).body(encrypted_bytes).headers(finalize_headers);
+        let res = c.http_client.execute(req.build().unwrap()).await.unwrap();
+        res.error_for_status_ref().unwrap();
+        let response_body = res.bytes().await.unwrap().to_vec();
+        let mut media_ids = UploadMediaResponse::default();
+
+        if let Ok(Ok(base64_bytes)) = String::from_utf8(response_body.clone()).map(|it| base64::engine::general_purpose::STANDARD.decode(it)) {
+            media_ids = UploadMediaResponse::parse_from_bytes(&base64_bytes).unwrap();
+        } else {
+            let pblite_res = String::from_utf8(response_body).unwrap();
+            pblite_rust::deserialize::unmarshal(&pblite_res, &mut media_ids).unwrap();
+        }
+
+        let (ext, format) = match mime_to_media_type(&attachment.mime_type).map(|it| Some(it)).unwrap_or(mime_to_media_type(&attachment.mime_type.split("/").next().unwrap_or(""))) {
+            Some((ext, format)) => (format!(".{ext}"), format.into()),
+            None => ("".into(), EnumOrUnknown::new(MediaFormats::UNSPECIFIED_TYPE)),
+        };
+
+        MediaContent {
+            format,
+            mediaID: media_ids.media.mediaID.clone(),
+            mediaName: attachment.file_name.clone().unwrap_or(format!("{}{ext}", Uuid::new_v4().to_string())),
+            size: attachment.data.len() as i64,
+            decryptionKey: key.clone(),
+            mimeType: attachment.mime_type.clone(),
+            ..Default::default()
+        }
+    }
+
+    fn build_media_update_headers(image_size: String, command: String, upload_offset: String, image_content_type: String, protocol: String) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert("sec-ch-ua", SEC_UA.parse().unwrap());
+        if protocol != "" {
+            headers.insert("x-goog-upload-protocol", protocol.parse().unwrap());
+        }
+        headers.insert("x-goog-upload-header-content-length", image_size.parse().unwrap());
+        headers.insert("sec-ch-ua-mobile", SEC_UA_MOBILE.parse().unwrap());
+        headers.insert("user-agent", USER_AGENT.parse().unwrap());
+        if image_content_type != "" {
+            headers.insert("x-goog-upload-header-content-type", image_content_type.parse().unwrap());
+        }
+        headers.insert("content-type", "application/x-www-form-urlencoded;charset=UTF-8".parse().unwrap());
+        if command != "" {
+            headers.insert("x-goog-upload-command", command.parse().unwrap());
+        }
+        if upload_offset != "" {
+            headers.insert("x-goog-upload-offset", upload_offset.parse().unwrap());
+        }
+        headers.insert("sec-ch-ua-platform", format!("\"{UA_PLATFORM}\"").parse().unwrap());
+        headers.insert("accept", "*/*".parse().unwrap());
+        headers.insert("origin", "https://messages.google.com".parse().unwrap());
+        headers.insert("sec-fetch-site", "cross-site".parse().unwrap());
+        headers.insert("sec-fetch-mode", "cors".parse().unwrap());
+        headers.insert("sec-fetch-dest", "empty".parse().unwrap());
+        headers.insert("referer", "https://messages.google.com/".parse().unwrap());
+        headers.insert("accept-encoding", "gzip, deflate, br".parse().unwrap());
+        headers.insert("accept-language", "en-US,en;q=0.9".parse().unwrap());
+        headers
     }
 }
 
@@ -564,89 +735,22 @@ const X_USER_AGENT: &'static str = "grpc-web-javascript/0.1";
 const GOOGLE_API_KEY: &'static str = "AIzaSyCA4RsOZUFrm9whhtGosPlJLmVPnfSHKz8"; //from beeper
 const SEC_UA_MOBILE: &'static str = "?1";
 
-fn config_version() -> ConfigVersion {
-    ConfigVersion {
-        Year: 2024,
-        Month: 12,
-        Day: 9,
-        V1: 4,
-        V2: 6,
-        ..Default::default()
-    }
-}
+pub fn upload_headers(req_body: &str) -> HeaderMap {
+    let mut headers = HeaderMap::new();
+	//headers.insert("host", "instantmessaging-pa.googleapis.com".parse().unwrap())
+	headers.insert("x-goog-download-metadata", req_body.parse().unwrap());
+	headers.insert("sec-ch-ua", SEC_UA.parse().unwrap());
+	headers.insert("sec-ch-ua-mobile", SEC_UA_MOBILE.parse().unwrap());
+	headers.insert("user-agent", USER_AGENT.parse().unwrap());
+	headers.insert("sec-ch-ua-platform", format!("\"{UA_PLATFORM}\"").parse().unwrap());
+	headers.insert("accept", "*/*".parse().unwrap());
+	headers.insert("origin", "https://messages.google.com".parse().unwrap());
+	headers.insert("sec-fetch-site", "cross-site".parse().unwrap());
+	headers.insert("sec-fetch-mode", "cors".parse().unwrap());
+	headers.insert("sec-fetch-dest", "empty".parse().unwrap());
+	headers.insert("referer", "https://messages.google.com/".parse().unwrap());
+	headers.insert("accept-encoding", "gzip, deflate, br".parse().unwrap());
+	headers.insert("accept-language", "en-US,en;q=0.9".parse().unwrap());
 
-pub fn generate_tmp_id() -> String {
-	let x = rand::random::<i64>() % 1000000000000;
-	return format!("tmp_{x}");
-}
-
-pub enum ActionMessage {
-    IsBugleDefault(IsBugleDefaultResponse),
-    GetUpdates(UpdateEvents),
-    ListConversations(ListConversationsResponse),
-    NotifyDittoActivity(NotifyDittoActivityResponse),
-    GetConversationType(GetConversationTypeResponse),
-    GetConversation(GetConversationResponse),
-    ListMessages(ListMessagesResponse),
-    SendMessage(SendMessageResponse),
-    SendReaction(SendReactionResponse),
-    DeleteMessage(DeleteMessageResponse),
-    GetParticipantsThumbnail(GetThumbnailResponse),
-    GetContactsThumbnail(GetThumbnailResponse),
-    ListContacts(ListContactsResponse),
-    ListTopContacts(ListTopContactsResponse),
-    GetOrCreateConversation(GetOrCreateConversationResponse),
-    UpdateConversation(UpdateConversationResponse),
-}
-
-impl ActionMessage {
-    pub fn message(&self) -> &dyn MessageDyn {
-        match self {
-            ActionMessage::DeleteMessage(m) => m,
-            ActionMessage::IsBugleDefault(m) => m,
-            ActionMessage::GetUpdates(m) => m,
-            ActionMessage::ListConversations(m) => m,
-            ActionMessage::NotifyDittoActivity(m) => m,
-            ActionMessage::GetConversationType(m) => m,
-            ActionMessage::GetConversation(m) => m,
-            ActionMessage::ListMessages(m) => m,
-            ActionMessage::SendMessage(m) => m,
-            ActionMessage::SendReaction(m) => m,
-            ActionMessage::GetParticipantsThumbnail(m) => m,
-            ActionMessage::GetContactsThumbnail(m) => m,
-            ActionMessage::ListContacts(m) => m,
-            ActionMessage::ListTopContacts(m) => m,
-            ActionMessage::GetOrCreateConversation(m) => m,
-            ActionMessage::UpdateConversation(m) => m,
-        }
-    }
-}
-
-impl Debug for ActionMessage {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let message: &dyn MessageDyn = self.message();
-        f.write_str(&protobuf_json_mapping::print_to_string(message).unwrap_or_default())
-    }
-}
-
-pub fn parse_action_message(data: Vec<u8>, action_type: ActionType) -> anyhow::Result<ActionMessage> {
-    Ok(match action_type {
-        ActionType::IS_BUGLE_DEFAULT => ActionMessage::IsBugleDefault(IsBugleDefaultResponse::parse_from_bytes(&data)?),
-        ActionType::GET_UPDATES => ActionMessage::GetUpdates(UpdateEvents::parse_from_bytes(&data)?),
-        ActionType::LIST_CONVERSATIONS => ActionMessage::ListConversations(ListConversationsResponse::parse_from_bytes(&data)?),
-        ActionType::NOTIFY_DITTO_ACTIVITY => ActionMessage::NotifyDittoActivity(NotifyDittoActivityResponse::parse_from_bytes(&data)?),
-        ActionType::GET_CONVERSATION_TYPE => ActionMessage::GetConversationType(GetConversationTypeResponse::parse_from_bytes(&data)?),
-        ActionType::GET_CONVERSATION => ActionMessage::GetConversation(GetConversationResponse::parse_from_bytes(&data)?),
-        ActionType::LIST_MESSAGES => ActionMessage::ListMessages(ListMessagesResponse::parse_from_bytes(&data)?),
-        ActionType::SEND_MESSAGE => ActionMessage::SendMessage(SendMessageResponse::parse_from_bytes(&data)?),
-        ActionType::SEND_REACTION => ActionMessage::SendReaction(SendReactionResponse::parse_from_bytes(&data)?),
-        ActionType::DELETE_MESSAGE => ActionMessage::DeleteMessage(DeleteMessageResponse::parse_from_bytes(&data)?),
-        ActionType::GET_PARTICIPANTS_THUMBNAIL => ActionMessage::GetParticipantsThumbnail(GetThumbnailResponse::parse_from_bytes(&data)?),
-        ActionType::GET_CONTACTS_THUMBNAIL => ActionMessage::GetContactsThumbnail(GetThumbnailResponse::parse_from_bytes(&data)?),
-        ActionType::LIST_CONTACTS => ActionMessage::ListContacts(ListContactsResponse::parse_from_bytes(&data)?),
-        ActionType::LIST_TOP_CONTACTS => ActionMessage::ListTopContacts(ListTopContactsResponse::parse_from_bytes(&data)?),
-        ActionType::GET_OR_CREATE_CONVERSATION => ActionMessage::GetOrCreateConversation(GetOrCreateConversationResponse::parse_from_bytes(&data)?),
-        ActionType::UPDATE_CONVERSATION => ActionMessage::UpdateConversation(UpdateConversationResponse::parse_from_bytes(&data)?),
-        _ => todo!("wasn't in beepers implementation"),
-    })
+    headers
 }
